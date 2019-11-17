@@ -6,15 +6,65 @@ extern crate shellexpand;
 extern crate regex;
 extern crate hex;
 
-use clap::{App, SubCommand, AppSettings};
+
+use clap::{App, SubCommand, AppSettings, Arg};
 use std::fs::File;
 use pcap_file::{PcapReader, PcapWriter, PcapHeader, DataLink};
 use pcap_file::errors::Error;
 use glob::glob;
 use std::path::PathBuf;
 use std::process::exit;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, Read};
 use regex::Regex;
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+
+
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CsvEntry {
+    #[serde(rename = "Unix time")]
+    unix_time: u64,
+
+    #[serde(rename = "BSSID")]
+    bssid: String,
+
+    #[serde(rename = "Signal strength(-dBm)")]
+    signal: f32,
+
+    #[serde(rename = "SSID")]
+    ssid: String,
+
+    #[serde(rename = "Longitude")]
+    lng: String,
+
+    #[serde(rename = "Latitude")]
+    lat: String,
+
+    #[serde(rename = "GPS Accuracy")]
+    gps: u32,
+
+    #[serde(rename = "AP Capabilities")]
+    capabilities: String,
+
+    #[serde(rename = "Channel")]
+    channel: Option<u32>,
+
+    #[serde(rename = "Frequency")]
+    frequency: Option<i32>
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CrackedNetwork {
+    #[serde(rename = "SSID")]
+    ssid: String,
+    #[serde(rename = "Longitude")]
+    lng: String,
+    #[serde(rename = "Latitude")]
+    lat: String,
+    #[serde(rename = "Password")]
+    password: String
+}
 
 
 fn merge_file(path: PathBuf, pcap_writer: &mut PcapWriter<File>) -> Result<(), Error> {
@@ -69,7 +119,7 @@ fn potfile() {
     let potfile = File::open(potfile_path.as_ref()).expect("Failed to open potfile");
     let reader = BufReader::new(potfile);
 
-    let mut networks_file = File::create("/tmp/networks.txt").expect("Failed to create /tmp/networks.txt");
+    let mut networks_file = File::create("/tmp/creds.txt").expect("Failed to create /tmp/creds.txt");
 
     for line in reader.lines() {
         if let Ok(line) = line {
@@ -78,7 +128,7 @@ fn potfile() {
 
             // Creds cracked from .pmkid format
             let wifi_16800 = Regex::new("^[a-z0-9]{32}\\*[a-z0-9]{12}\\*[a-z0-9]{11}").unwrap();
-            
+
             if wifi_2500.is_match(&line) {
                 let creds = get_creds_wifi_2500(&line);
                 println!("Wifi {:>5}: {}", "2500", creds);
@@ -134,6 +184,52 @@ fn from_hex(s : &str) -> Result<String, Box<hex::FromHexError>> {
     }
 }
 
+fn filter(input: &str) {
+    println!("Refreshing /tmp/creds.txt");
+    potfile();
+    println!("Refreshed /tmp/creds.txt");
+
+    let mut creds_file = File::open("/tmp/creds.txt").expect("Failed to open /tmp/creds.txt");
+    let mut creds_contents = String::new();
+    creds_file.read_to_string(&mut creds_contents).expect("Failed to read /tmp/creds.txt");
+
+    let cracked_ssids = creds_contents
+        .lines()
+        .map(|l| {
+            let parts = l.split(":")
+                .collect::<Vec<_>>();
+
+            (String::from(parts[0]), String::from(parts[1]))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut writer = csv::Writer::from_path("/tmp/cracked.csv").expect("Failed to open output file");
+
+    let mut reader = csv::Reader::from_path(input).expect("Failed to open input file");
+    for result in reader.deserialize::<CsvEntry>() {
+        match result {
+            Ok(rec) => {
+                println!("Processing record: {}, {}/{}", rec.ssid, rec.lat, rec.lng);
+                if cracked_ssids.contains_key(&rec.ssid) {
+                    println!("Contains cracked password");
+                    let password = &cracked_ssids[&rec.ssid];
+                    let cracked_network = CrackedNetwork {
+                        ssid: rec.ssid,
+                        lng: rec.lng,
+                        lat: rec.lat,
+                        password: password.clone()
+                    };
+
+                    writer.serialize(cracked_network).expect("Failed to write record");
+                }
+            },
+            Err(e) => println!("Error: {}", e)
+        }
+    }
+
+    println!("Wrote filtered network to '/tmp/cracked.csv'");
+}
+
 fn main() {
     println!("wifi-cap-parser");
 
@@ -145,7 +241,16 @@ fn main() {
         .subcommand(SubCommand::with_name("merge")
             .about("Merges all .pcap files in the current directory and writes to /tmp/all.pcap"))
         .subcommand(SubCommand::with_name("potfile")
-            .about("Parses potfile and writes to \"networks.txt\" lines with the format \"<SSID>:<Password>\""))
+            .about("Parses potfile and writes to \"/tmp/creds.txt\" lines with the format \"<SSID>:<Password>\""))
+        .subcommand(SubCommand::with_name("filter")
+            .about("Filters a 'wifiscan-export.csv' file (generated from Wifi Tracker android app) to only those networks whose password has been recovered and writes to /tmp/cracked.csv")
+            .arg(Arg::with_name("input")
+                .short("i")
+                .long("input")
+                .value_name("INPUT")
+                .help("Input wifiscan-export.csv file")
+                .takes_value(true)
+                .required(true)))
         .get_matches();
 
     match matches.subcommand_name() {
@@ -153,6 +258,14 @@ fn main() {
             match name.as_ref() {
                 "merge" => merge(),
                 "potfile" => potfile(),
+                "filter" => {
+                    let input = matches.subcommand_matches("filter")
+                        .expect("Failed to get filter subcommand matcher")
+                        .value_of("input")
+                        .expect("Failed to get value of input arg");
+
+                    filter(input);
+                },
                 _ => {
                     println!("Unrecognized command, quitting");
                     exit(-1);
